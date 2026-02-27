@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import {
-  LayoutDashboard, FileText, LogOut, Menu, X,
+  LayoutDashboard, FileText, LogOut, Menu,
   ChevronRight, Bell
 } from 'lucide-react';
 import { ROUTES } from '@/config/constants';
