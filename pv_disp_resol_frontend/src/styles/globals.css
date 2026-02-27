@@ -1,0 +1,74 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html {
+    font-family: 'DM Sans', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    color-scheme: light;
+  }
+
+  body {
+    @apply bg-surface-50 text-surface-900 m-0 p-0;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Syne', sans-serif;
+    font-weight: 600;
+    line-height: 1.2;
+  }
+
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-brand-500;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5
+           bg-brand-600 text-white font-body font-medium rounded-xl
+           hover:bg-brand-700 active:bg-brand-800
+           transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed
+           focus-visible:ring-2 focus-visible:ring-brand-400 focus-visible:ring-offset-2;
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2
+           text-surface-800 font-body font-medium rounded-xl
+           hover:bg-surface-100 active:bg-surface-200
+           transition-all duration-150 disabled:opacity-50;
+  }
+
+  .card {
+    @apply bg-white rounded-xl2 shadow-card border border-surface-200/60;
+  }
+
+  .input-base {
+    @apply w-full px-4 py-2.5 rounded-xl border border-surface-200
+           bg-white text-surface-900 font-body text-sm
+           placeholder:text-surface-300
+           focus:outline-none focus:ring-2 focus:ring-brand-400 focus:border-transparent
+           transition duration-150;
+  }
+
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #c8cfe0; border-radius: 9999px; }
+::-webkit-scrollbar-thumb:hover { background: #9ea8bf; }
+
+/* Page transition animation delays */
+.stagger-1 { animation-delay: .05s; }
+.stagger-2 { animation-delay: .10s; }
+.stagger-3 { animation-delay: .15s; }
+.stagger-4 { animation-delay: .20s; }
+.stagger-5 { animation-delay: .25s; }

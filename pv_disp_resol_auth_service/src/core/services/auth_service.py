@@ -102,6 +102,7 @@ async def login(body: LoginRequest, db: AsyncSession, settings: Settings) -> Log
 
     try:
         user = await user_repo.get_by_email(body.email)
+        
         if not user or not verify_password(body.password, user.password_hash):
             raise InvalidCredentialsError()
 
@@ -110,10 +111,12 @@ async def login(body: LoginRequest, db: AsyncSession, settings: Settings) -> Log
         await db.refresh(user)
 
         logger.info("Login OK | user_id=%s", user.user_id)
-        return LoginResponse(
+        lr = LoginResponse(
             user=UserPublic.model_validate(user),
             tokens=TokenPair(access_token=access_token, refresh_token=refresh_token),
         )
+        print(lr)
+        return lr
     except (InvalidCredentialsError, DatabaseError):
         raise
     except Exception as exc:
