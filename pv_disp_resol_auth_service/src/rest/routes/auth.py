@@ -4,7 +4,7 @@ from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import Settings, get_settings
-from src.core.services import get_current_user, login, logout, refresh_token, signup
+from src.core.services import get_current_user, login, logout, refresh_token as refresh_token_service, signup
 from src.data.clients import get_db
 from src.schemas import (
     AccessTokenResponse,
@@ -18,7 +18,9 @@ from src.schemas import (
 from src.utils.jwt_utils import (
     TokenIdentity,
     _clear_access_cookie,
+    _clear_refresh_cookie,
     _set_access_cookie,
+    _set_refresh_cookie,
     get_current_user_id,
 )
 
@@ -37,7 +39,9 @@ async def signup_route(
 ) -> SignupResponse:
     result = await signup(body, db, settings)
     _set_access_cookie(response, result.tokens.access_token, settings)
-    result.tokens.access_token = ""
+    _set_refresh_cookie(response, result.tokens.refresh_token, settings)
+    result.tokens.access_token  = ""
+    result.tokens.refresh_token = ""
     return result
 
 
@@ -52,7 +56,9 @@ async def login_route(
 ) -> LoginResponse:
     result = await login(body, db, settings)
     _set_access_cookie(response, result.tokens.access_token, settings)
-    result.tokens.access_token = ""
+    _set_refresh_cookie(response, result.tokens.refresh_token, settings)
+    result.tokens.access_token  = ""
+    result.tokens.refresh_token = ""
     return result
 
 
@@ -61,18 +67,18 @@ async def login_route(
 @router.post("/refresh", response_model=AccessTokenResponse)
 async def refresh_route(
     response: Response,
-    # Refresh token travels in the JSON body — keep it out of cookies
-    # so it is never sent on every request automatically.
-    body_refresh_token: str | None = None,   # accept via JSON body or query param
+    refresh_token: str | None = Cookie(default=None, alias="refresh_token"),
     db: AsyncSession   = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> AccessTokenResponse:
-    if not body_refresh_token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token required")
+    if not refresh_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No refresh token")
 
-    result = await refresh_token(body_refresh_token, db, settings)
+    result = await refresh_token_service(refresh_token, db, settings)
     _set_access_cookie(response, result.access_token, settings)
-    result.access_token = ""
+    _set_refresh_cookie(response, result.refresh_token, settings)
+    result.access_token  = ""
+    result.refresh_token = ""
     return result
 
 
@@ -81,12 +87,13 @@ async def refresh_route(
 @router.post("/logout", response_model=LogoutResponse)
 async def logout_route(
     response: Response,
-    body_refresh_token: str | None = None,
-    db: AsyncSession   = Depends(get_db),
-    identity: TokenIdentity = Depends(get_current_user_id),   # validates access cookie
+    refresh_token: str | None = Cookie(default=None, alias="refresh_token"),
+    db: AsyncSession        = Depends(get_db),
+    identity: TokenIdentity = Depends(get_current_user_id),
 ) -> LogoutResponse:
-    result = await logout(body_refresh_token, db)
+    result = await logout(refresh_token, db)
     _clear_access_cookie(response)
+    _clear_refresh_cookie(response)
     return result
 
 

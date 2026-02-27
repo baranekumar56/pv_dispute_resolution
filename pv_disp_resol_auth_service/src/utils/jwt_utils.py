@@ -15,8 +15,11 @@ from src.core.exceptions import TokenExpiredError, TokenInvalidError, TokenTypeM
 logger   = logging.getLogger(__name__)
 _pwd_ctx = CryptContext(schemes=["argon2"], deprecated="auto")
 
-COOKIE_NAME    = "access_token"
-COOKIE_MAX_AGE = 15 * 60  # must match JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+COOKIE_NAME            = "access_token"
+COOKIE_MAX_AGE         = 15 * 60        # 15 min — must match JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+
+REFRESH_COOKIE_NAME    = "refresh_token"
+REFRESH_COOKIE_MAX_AGE = 7 * 24 * 60 * 60  # 7 days — must match JWT_REFRESH_TOKEN_EXPIRE_DAYS
 
 
 # ── Password ───────────────────────────────────────────────────────────────────
@@ -44,13 +47,12 @@ def _build_token(
 ) -> tuple[str, str]:
     """
     Merges caller-supplied payload with standard claims.
-    Returns (encoded_jwt, jti) so callers can persist the jti.
+    Returns (encoded_jwt, jti).
     """
     jti = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
-
     claims = {
-        **payload,           # e.g. {"user_id": 42, ...}
+        **payload,
         "type": token_type,
         "iat":  now,
         "exp":  now + expires_delta,
@@ -127,10 +129,6 @@ class TokenIdentity:
 async def get_current_user_id(
     access_token: str | None = Cookie(default=None, alias="access_token"),
 ) -> TokenIdentity:
-    """
-    Validates the access-token cookie and returns a TokenIdentity containing
-    both user_id and jti — use jti for revocation checks on sensitive routes.
-    """
     if not access_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
@@ -168,3 +166,19 @@ def _set_access_cookie(response: Response, access_token: str, settings: Settings
 
 def _clear_access_cookie(response: Response) -> None:
     response.delete_cookie(key=COOKIE_NAME, path="/")
+
+
+def _set_refresh_cookie(response: Response, refresh_token: str, settings: Settings) -> None:
+    response.set_cookie(
+        key=REFRESH_COOKIE_NAME,
+        value=refresh_token,
+        httponly=True,
+        samesite="lax",
+        max_age=REFRESH_COOKIE_MAX_AGE,
+        path="/api/v1/auth/refresh",   # scoped — browser only sends this to the refresh endpoint
+    )
+
+
+
+def _clear_refresh_cookie(response: Response) -> None:
+    response.delete_cookie(key=REFRESH_COOKIE_NAME, path="/api/v1/auth/refresh")

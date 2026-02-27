@@ -34,11 +34,14 @@ class TokenPair(BaseModel):
     token_type:    str = Field(default="bearer")
 
 
-class AccessTokenResponse(BaseModel):
-    access_token:  str = Field(..., description="New short-lived JWT access token")
-    refresh_token: str = Field(..., description="New rotated JWT refresh token")
-    token_type:    str = Field(default="bearer")
+# class AccessTokenResponse(BaseModel):
+#     access_token:  str = Field(..., description="New short-lived JWT access token")
+#     refresh_token: str = Field(..., description="New rotated JWT refresh token")
+#     token_type:    str = Field(default="bearer")
 
+class AccessTokenResponse(BaseModel):
+    access_token:  str = ""
+    refresh_token: str = ""
 
 class LogoutResponse(BaseModel):
     message: str = Field(default="Successfully logged out")

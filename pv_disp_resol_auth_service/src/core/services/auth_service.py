@@ -1,7 +1,6 @@
 import logging
 from datetime import datetime, timezone
 
-from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import Settings
@@ -45,11 +44,11 @@ async def _issue_token_pair(
 ) -> tuple[str, str]:
     """
     Mint a new access + refresh pair.
-    Stages the refresh token row (with user_id + jti) — caller must commit.
+    Stages the refresh token row — caller must commit.
     Returns (access_token, refresh_token).
     """
-    access_token,  access_jti  = create_access_token(user_id, settings)
-    refresh_token, refresh_jti = create_refresh_token(user_id, settings)
+    access_token,  _            = create_access_token(user_id, settings)
+    refresh_token, refresh_jti  = create_refresh_token(user_id, settings)
 
     await token_repo.create(
         user_id=user_id,
@@ -130,35 +129,30 @@ async def refresh_token(
     db: AsyncSession,
     settings: Settings,
 ) -> AccessTokenResponse:
-    """
-    Accepts the raw refresh JWT, validates it cryptographically, then
-    looks up the DB row by jti for revocation / expiry checks.
-    Rotates: revokes old row, issues new pair.
-    """
     logger.info("Token refresh attempt")
     token_repo = RefreshTokenRepository(db)
 
     try:
-        # 1. Cryptographic validation — reject malformed tokens before hitting DB
-        payload = decode_refresh_token(raw_refresh_token, settings)
+        # 1. Cryptographic validation first
+        payload     = decode_refresh_token(raw_refresh_token, settings)
         user_id     = int(payload["user_id"])
         refresh_jti = payload["jti"]
 
-        # 2. DB checks via jti (fast indexed lookup, no raw token needed)
+        # 2. DB checks via jti
         token_record = await token_repo.get_by_jti(refresh_jti)
         if not token_record:
             logger.warning("Refresh failed — jti not found | jti=%s", refresh_jti)
             raise TokenNotFoundError()
         if token_record.is_revoked:
-            logger.warning("Refresh reuse detected — revoking all tokens | user_id=%s", user_id)
-            # Refresh token reuse → possible token theft; revoke everything for this user
+            # Reuse detected — likely token theft, nuke everything for this user
+            logger.warning("Refresh token reuse detected — revoking all | user_id=%s", user_id)
             await token_repo.revoke_all_for_user(user_id)
             await db.commit()
             raise TokenRevokedError()
         if token_record.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
             raise TokenExpiredError()
 
-        # 3. Rotate
+        # 3. Rotate — revoke old, issue new pair
         await token_repo.revoke(token_record)
         new_access, new_refresh = await _issue_token_pair(user_id, settings, token_repo)
         await db.commit()
@@ -177,7 +171,6 @@ async def refresh_token(
 # ── logout ─────────────────────────────────────────────────────────────────────
 
 async def logout(raw_refresh_token: str | None, db: AsyncSession) -> LogoutResponse:
-    """Revoke the refresh token whose cookie was sent alongside the request."""
     logger.info("Logout attempt")
     token_repo = RefreshTokenRepository(db)
 

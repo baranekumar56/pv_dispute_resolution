@@ -5,11 +5,11 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.config import Settings, get_settings
+from src.config import Settings
 from src.core.exceptions import DatabaseError
 from src.data.models.postgres import User, RefreshToken
 
-logger   = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class UserRepository:
