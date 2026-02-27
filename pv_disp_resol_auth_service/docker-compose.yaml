@@ -1,0 +1,57 @@
+services:
+
+  # ── PostgreSQL with pgvector ─────────────────────────────────────────────────
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: dispute_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB:       dispute_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d dispute_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+
+  # ── FastAPI backend ──────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dispute_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy        # waits for DB healthcheck to pass before starting
+    env_file:
+      - .env
+    environment:
+      # Override DATABASE_URL so it points at the db container, not localhost
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/dispute_db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src                    # mount source for live reload in dev
+    command: >
+      python -m uvicorn src.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload                            # remove --reload in production
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+
+volumes:
+  postgres_data:
