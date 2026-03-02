@@ -7,8 +7,8 @@ from src.config import get_settings
 from src.core.exceptions import register_exception_handlers
 from src.data.clients import engine
 from src.observability.logging import setup_logging
-from src.rest.middleware import LoggingMiddleware, register_cors
-from src.rest.routes import auth_router, health_router
+from src.api.rest.middleware import LoggingMiddleware, register_cors
+from src.api.rest.routes import auth_router, health_router
 
 settings = get_settings()
 logger   = logging.getLogger(__name__)
