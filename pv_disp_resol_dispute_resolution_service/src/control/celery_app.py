@@ -24,3 +24,4 @@ celery_app.conf.update(
     },
     task_default_queue="default",
 )
+

@@ -444,7 +444,7 @@ async def node_persist_results(
 ) -> EmailProcessingState:
     if not db_session:
         return state
-
+ 
     from src.data.repositories.repositories import (
         DisputeTypeRepository, DisputeRepository, EmailRepository,
         MemoryEpisodeRepository, OpenQuestionRepository, UserRepository,
