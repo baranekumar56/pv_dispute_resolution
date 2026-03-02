@@ -1,0 +1,101 @@
+folder_creation_windows_command for front end:
+please use powershell : )
+follow the order of execution 
+
+mkdir app, assets, config, components, features, hooks, layouts, lib,  services, styles, types, utils
+cd .\app
+New-Item -Path .\store.ts -ItemType File
+New-Item -Path .\rootReducer.ts -ItemType File
+New-Item -Path .\middleware.ts -ItemType File
+New-Item -Path .\routes.ts -ItemType File
+
+cd ..
+cd .\assets
+mkdir images, fonts, icons
+
+cd ..
+cd .\config
+New-Item -Path .\env.ts -ItemType File
+New-Item -Path .\constants.ts -ItemType File
+
+cd ..
+cd .\components
+mkdir ui, common, forms
+
+cd ..
+cd .\features
+mkdir auth 
+cd auth
+mkdir components, hooks, slices, services, types
+New-Item -Path .\index.ts -ItemType File
+
+cd ..
+cd ..
+
+
+folder_creation_windows_command for backend:
+
+mkdir src
+cd .\src
+
+mkdir api
+cd .\api
+
+mkdir rest
+cd .\rest
+
+New-Item -Path .\app.py -ItemType File
+
+mkdir routes
+cd .\routes
+New-Item -Path .\auth.py -ItemType File
+
+cd ..
+New-Item -Path .\dependencies.py -ItemType File
+
+cd ..
+mkdir middleware
+cd .\middleware
+
+New-Item -Path .\cors.py -ItemType File
+New-Item -Path .\logging.py -ItemType File
+New-Item -Path .\error_handler.py -ItemType File
+New-Item -Path .\metrics.py -ItemType File
+
+cd ..
+mkdir core
+cd ./core
+mkdir exceptions, services
+
+cd ..
+mkdir data
+cd ./data
+mkdir clients, repositories, models, migrations
+cd ./models
+mkdir postgres, mongo
+cd ../..
+
+mkdir handlers
+cd ./handlers
+mkdir http_clients
+
+cd ..
+mkdir control
+cd ./control
+mkdir agents
+cd ..
+
+mkdir observability
+cd ./observability
+mkdir logging, metrics, tracing
+
+cd ..
+
+mkdir schemas, config, constants, utils
+New-Item -Path .\main.py -ItemType File
+
+cd ..
+
+mkdir examples, docs, requirements
+
+
