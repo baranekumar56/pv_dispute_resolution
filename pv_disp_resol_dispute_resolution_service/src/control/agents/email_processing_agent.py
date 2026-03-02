@@ -4,22 +4,17 @@ LangGraph-based email processing agent (Groq edition).
 Pipeline:
   extract_text
       ↓
-  extract_invoice_data_via_groq
+  extract_invoice_data_via_groq   ← NEW: Groq intelligently extracts all invoice fields
       ↓
-  identify_invoice
+  identify_invoice                ← matches extracted invoice_number against DB
       ↓
-  fetch_context
+  fetch_context                   ← loads invoice + payment records + memory
       ↓
-  classify_email
+  classify_email                  ← DISPUTE | CLARIFICATION | UNKNOWN
       ↓
-  generate_ai_response
+  generate_ai_response            ← tries to auto-respond
       ↓
-  persist_results
-
-KEY DESIGN: Each node that needs DB access creates its OWN session.
-This avoids "cannot perform operation: another operation is in progress"
-which happens when a single AsyncSession is shared across LangGraph's
-internal asyncio.create_task() calls.
+  persist_results                 ← saves everything to DB
 """
 
 from __future__ import annotations
@@ -38,29 +33,42 @@ logger = logging.getLogger(__name__)
 # ─── State ────────────────────────────────────────────────────────────────────
 
 class EmailProcessingState(TypedDict):
+    # Input
     email_id: int
     sender_email: str
     subject: str
     body_text: str
     attachment_texts: List[str]
+
+    # Text
     all_text: str
-    groq_extracted: Optional[Dict]
-    candidate_invoice_numbers: List[str]
+
+    # Groq-extracted invoice data  (NEW)
+    groq_extracted: Optional[Dict]           # raw dict from Groq extraction
+    candidate_invoice_numbers: List[str]     # pulled from groq_extracted + regex fallback
+
+    # DB-matched
     matched_invoice_id: Optional[int]
     matched_invoice_number: Optional[str]
     matched_payment_id: Optional[int]
     customer_id: Optional[str]
     routing_confidence: float
+
+    # Context
     invoice_details: Optional[Dict]
     payment_details: Optional[Dict]
     existing_dispute_id: Optional[int]
     memory_summary: Optional[str]
     recent_episodes: List[Dict]
     pending_questions: List[Dict]
+
+    # Classification
     classification: str
     dispute_type_name: str
     priority: str
     description: str
+
+    # AI output
     ai_summary: str
     ai_response: Optional[str]
     confidence_score: float
@@ -69,6 +77,8 @@ class EmailProcessingState(TypedDict):
     memory_context_used: bool
     episodes_referenced: List[int]
     _answers_pending_questions: List[int]
+
+    # Final
     dispute_id: Optional[int]
     analysis_id: Optional[int]
     error: Optional[str]
@@ -82,7 +92,9 @@ def _build_full_text(state: EmailProcessingState) -> str:
 
 
 def _regex_invoice_numbers(text: str) -> List[str]:
+    """Fallback regex extraction in case Groq can't find a number."""
     candidates: set[str] = set()
+
     patterns = [
         r"(?:invoice\s*(?:no\.?|number|#|num)[:\s#-]*)([\w\-/]+)",
         r"(?:inv[\.#\-/]*)([\w\-/]{4,20})",
@@ -96,103 +108,107 @@ def _regex_invoice_numbers(text: str) -> List[str]:
             val = m.group(1).strip().upper()
             if len(val) >= 3:
                 candidates.add(val)
+
     return list(candidates)
 
 
 # ─── Nodes ────────────────────────────────────────────────────────────────────
 
 async def node_extract_text(state: EmailProcessingState) -> EmailProcessingState:
-    return {**state, "all_text": _build_full_text(state)}
+    all_text = _build_full_text(state)
+    return {**state, "all_text": all_text}
 
 
 async def node_extract_invoice_data_via_groq(
     state: EmailProcessingState, llm_client=None
 ) -> EmailProcessingState:
+    """
+    NEW NODE: Send all text to Groq and extract invoice data intelligently.
+    This gives us a structured dict with invoice_number, totals, line_items, etc.
+    The extracted data is stored in groq_extracted and also used for DB matching.
+    """
     groq_extracted: Optional[Dict] = None
     candidates: List[str] = []
 
     if llm_client:
         try:
             groq_extracted = await llm_client.extract_invoice_data(state["all_text"])
+            # Pull invoice number from Groq result (primary)
             inv_num = groq_extracted.get("invoice_number")
             if inv_num:
                 candidates.append(str(inv_num).upper().strip())
+            # Also try PO number as secondary candidate
             po = groq_extracted.get("po_number")
             if po:
                 candidates.append(str(po).upper().strip())
         except Exception as e:
-            logger.warning(
-                f"[email_id={state['email_id']}] Groq invoice extraction failed: {e}. Falling back to regex."
-            )
+            logger.warning(f"[email_id={state['email_id']}] Groq invoice extraction failed: {e}. Falling back to regex.")
 
-    for c in _regex_invoice_numbers(state["all_text"]):
+    # Regex fallback
+    regex_candidates = _regex_invoice_numbers(state["all_text"])
+    for c in regex_candidates:
         if c not in candidates:
             candidates.append(c)
 
     logger.info(f"[email_id={state['email_id']}] Invoice candidates: {candidates}")
-    return {**state, "groq_extracted": groq_extracted, "candidate_invoice_numbers": candidates}
+    return {
+        **state,
+        "groq_extracted": groq_extracted,
+        "candidate_invoice_numbers": candidates,
+    }
 
 
 async def node_identify_invoice(
     state: EmailProcessingState, db_session=None
 ) -> EmailProcessingState:
-    """Each DB node creates its own session to avoid asyncpg cross-task conflicts."""
-    from src.data.clients.postgres import AsyncSessionLocal
+    if not db_session:
+        return {**state, "matched_invoice_id": None, "routing_confidence": 0.0}
+
     from src.data.repositories.repositories import InvoiceRepository, PaymentRepository
+    inv_repo = InvoiceRepository(db_session)
+    pay_repo = PaymentRepository(db_session)
 
     matched_invoice = None
     matched_payment = None
     confidence = 0.0
 
-    async with AsyncSessionLocal() as session:
-        inv_repo = InvoiceRepository(session)
-        pay_repo = PaymentRepository(session)
+    # Exact match
+    for candidate in state["candidate_invoice_numbers"]:
+        invoice = await inv_repo.get_by_invoice_number(candidate)
+        if invoice:
+            matched_invoice = invoice
+            confidence = 0.95
+            break
 
-        # Exact match
+    # Fuzzy match fallback
+    if not matched_invoice and state["candidate_invoice_numbers"]:
         for candidate in state["candidate_invoice_numbers"]:
-            invoice = await inv_repo.get_by_invoice_number(candidate)
-            if invoice:
-                matched_invoice = invoice
-                confidence = 0.95
+            results = await inv_repo.search_by_number_fuzzy(candidate)
+            if results:
+                matched_invoice = results[0]
+                confidence = 0.65
                 break
 
-        # Fuzzy fallback
-        if not matched_invoice and state["candidate_invoice_numbers"]:
-            for candidate in state["candidate_invoice_numbers"]:
-                results = await inv_repo.search_by_number_fuzzy(candidate)
-                if results:
-                    matched_invoice = results[0]
-                    confidence = 0.65
-                    break
+    # Derive customer_id from Groq extraction first, then sender email domain
+    customer_id = state.get("customer_id")
+    if not customer_id and state.get("groq_extracted"):
+        customer_id = state["groq_extracted"].get("customer_id") or state["groq_extracted"].get("customer_name")
+    if not customer_id:
+        sender = state["sender_email"]
+        domain = sender.split("@")[-1].split(".")[0] if "@" in sender else sender
+        customer_id = domain
 
-        # Derive customer_id
-        customer_id = state.get("customer_id")
-        if not customer_id and state.get("groq_extracted"):
-            customer_id = (
-                state["groq_extracted"].get("customer_id")
-                or state["groq_extracted"].get("customer_name")
-            )
-        if not customer_id:
-            sender = state["sender_email"]
-            domain = sender.split("@")[-1].split(".")[0] if "@" in sender else sender
-            customer_id = domain
-
-        # Payment match
-        if matched_invoice and customer_id:
-            matched_payment = await pay_repo.get_by_customer_and_invoice(
-                customer_id, matched_invoice.invoice_number
-            )
-
-        # Extract values before session closes
-        invoice_id = matched_invoice.invoice_id if matched_invoice else None
-        invoice_number = matched_invoice.invoice_number if matched_invoice else None
-        payment_id = matched_payment.payment_detail_id if matched_payment else None
+    # Try to find matching payment
+    if matched_invoice and customer_id:
+        matched_payment = await pay_repo.get_by_customer_and_invoice(
+            customer_id, matched_invoice.invoice_number
+        )
 
     return {
         **state,
-        "matched_invoice_id": invoice_id,
-        "matched_invoice_number": invoice_number,
-        "matched_payment_id": payment_id,
+        "matched_invoice_id": matched_invoice.invoice_id if matched_invoice else None,
+        "matched_invoice_number": matched_invoice.invoice_number if matched_invoice else None,
+        "matched_payment_id": matched_payment.payment_detail_id if matched_payment else None,
         "customer_id": customer_id,
         "routing_confidence": confidence,
     }
@@ -201,7 +217,9 @@ async def node_identify_invoice(
 async def node_fetch_context(
     state: EmailProcessingState, db_session=None
 ) -> EmailProcessingState:
-    from src.data.clients.postgres import AsyncSessionLocal
+    if not db_session:
+        return {**state, "invoice_details": None, "payment_details": None}
+
     from src.data.repositories.repositories import (
         InvoiceRepository, PaymentRepository, DisputeRepository,
         MemoryEpisodeRepository, MemorySummaryRepository, OpenQuestionRepository,
@@ -214,47 +232,49 @@ async def node_fetch_context(
     recent_episodes = []
     pending_questions = []
 
-    async with AsyncSessionLocal() as session:
-        if state["matched_invoice_id"]:
-            inv_repo = InvoiceRepository(session)
-            invoice = await inv_repo.get_by_id(state["matched_invoice_id"])
-            if invoice:
-                db_details = invoice.invoice_details or {}
-                groq_data = state.get("groq_extracted") or {}
-                invoice_details = {**db_details, **{k: v for k, v in groq_data.items() if v is not None}}
+    if state["matched_invoice_id"]:
+        inv_repo = InvoiceRepository(db_session)
+        invoice = await inv_repo.get_by_id(state["matched_invoice_id"])
+        if invoice:
+            # Merge DB invoice_details with Groq-extracted data for richer context
+            db_details = invoice.invoice_details or {}
+            groq_data = state.get("groq_extracted") or {}
+            # Groq wins on fields it found; DB fills the rest
+            invoice_details = {**db_details, **{k: v for k, v in groq_data.items() if v is not None}}
 
-        if state["matched_payment_id"]:
-            pay_repo = PaymentRepository(session)
-            payment = await pay_repo.get_by_id(state["matched_payment_id"])
-            if payment:
-                payment_details = payment.payment_details
+    if state["matched_payment_id"]:
+        pay_repo = PaymentRepository(db_session)
+        payment = await pay_repo.get_by_id(state["matched_payment_id"])
+        if payment:
+            payment_details = payment.payment_details
 
-        if state["customer_id"] and state["matched_invoice_id"]:
-            dispute_repo = DisputeRepository(session)
-            open_disputes = await dispute_repo.get_by_customer(state["customer_id"])
-            matching = [d for d in open_disputes if d.invoice_id == state["matched_invoice_id"]]
-            if matching:
-                existing_dispute = matching[0]
-                existing_dispute_id = existing_dispute.dispute_id
+    # Existing open disputes for customer + invoice
+    if state["customer_id"] and state["matched_invoice_id"]:
+        dispute_repo = DisputeRepository(db_session)
+        open_disputes = await dispute_repo.get_by_customer(state["customer_id"])
+        matching = [d for d in open_disputes if d.invoice_id == state["matched_invoice_id"]]
+        if matching:
+            existing_dispute = matching[0]
+            existing_dispute_id = existing_dispute.dispute_id
 
-                ep_repo = MemoryEpisodeRepository(session)
-                recent_eps = await ep_repo.get_latest_n(existing_dispute_id, n=5)
-                recent_episodes = [
-                    {"actor": ep.actor, "type": ep.episode_type, "text": ep.content_text[:400]}
-                    for ep in recent_eps
-                ]
+            ep_repo = MemoryEpisodeRepository(db_session)
+            recent_eps = await ep_repo.get_latest_n(existing_dispute_id, n=5)
+            recent_episodes = [
+                {"actor": ep.actor, "type": ep.episode_type, "text": ep.content_text[:400]}
+                for ep in recent_eps
+            ]
 
-                sum_repo = MemorySummaryRepository(session)
-                summary = await sum_repo.get_for_dispute(existing_dispute_id)
-                if summary:
-                    memory_summary = summary.summary_text
+            sum_repo = MemorySummaryRepository(db_session)
+            summary = await sum_repo.get_for_dispute(existing_dispute_id)
+            if summary:
+                memory_summary = summary.summary_text
 
-                q_repo = OpenQuestionRepository(session)
-                pending_qs = await q_repo.get_pending_for_dispute(existing_dispute_id)
-                pending_questions = [
-                    {"question_id": q.question_id, "text": q.question_text}
-                    for q in pending_qs
-                ]
+            q_repo = OpenQuestionRepository(db_session)
+            pending_qs = await q_repo.get_pending_for_dispute(existing_dispute_id)
+            pending_questions = [
+                {"question_id": q.question_id, "text": q.question_text}
+                for q in pending_qs
+            ]
 
     return {
         **state,
@@ -283,6 +303,7 @@ async def node_classify_email(
             "_answers_pending_questions": [],
         }
 
+    # Build extracted data block
     groq_block = ""
     if state.get("groq_extracted"):
         groq_block = f"\nEXTRACTED INVOICE DATA: {json.dumps(state['groq_extracted'])}"
@@ -379,8 +400,6 @@ Instructions:
 - If you have enough information to fully resolve or clarify this query, provide a complete response.
 - If you are missing critical information, ask for it specifically.
 - Never make up invoice amounts or dates.
-- Please dont use any of your own knowledge about typical invoice formats, instead rely solely on the provided context and extracted data.
-- You always dont need to generate an AI response. If the email is just a simple follow-up or confirmation, you can skip the response.
 - Be professional and concise.
 
 Return ONLY valid JSON:
@@ -423,7 +442,9 @@ Return ONLY valid JSON:
 async def node_persist_results(
     state: EmailProcessingState, db_session=None
 ) -> EmailProcessingState:
-    from src.data.clients.postgres import AsyncSessionLocal
+    if not db_session:
+        return state
+
     from src.data.repositories.repositories import (
         DisputeTypeRepository, DisputeRepository, EmailRepository,
         MemoryEpisodeRepository, OpenQuestionRepository, UserRepository,
@@ -431,151 +452,146 @@ async def node_persist_results(
     from src.data.models.postgres.models import (
         DisputeMaster, DisputeAIAnalysis,
         DisputeMemoryEpisode, DisputeOpenQuestion,
-        DisputeActivityLog, DisputeAssignment, EmailInbox,
+        DisputeActivityLog, DisputeAssignment,
     )
     from sqlalchemy import update as sa_update
+    from src.data.models.postgres.models import EmailInbox
 
     try:
-        async with AsyncSessionLocal() as session:
-            # 1. Resolve dispute type
-            dtype_repo = DisputeTypeRepository(session)
-            dispute_type = await dtype_repo.get_by_name(state["dispute_type_name"])
-            if not dispute_type:
-                dispute_type = await dtype_repo.get_by_name("General Clarification")
+        # 1. Resolve dispute type
+        dtype_repo = DisputeTypeRepository(db_session)
+        dispute_type = await dtype_repo.get_by_name(state["dispute_type_name"])
+        if not dispute_type:
+            dispute_type = await dtype_repo.get_by_name("General Clarification")
 
-            dispute_id = state.get("existing_dispute_id")
+        dispute_id = state.get("existing_dispute_id")
 
-            # 2. Create or reuse dispute
-            if not dispute_id:
-                dispute = DisputeMaster(
-                    email_id=state["email_id"],
-                    invoice_id=state.get("matched_invoice_id"),
-                    payment_detail_id=state.get("matched_payment_id"),
-                    customer_id=state["customer_id"] or "unknown",
-                    dispute_type_id=dispute_type.dispute_type_id,
-                    status="OPEN",
-                    priority=state.get("priority", "MEDIUM"),
-                    description=state.get("description", ""),
-                )
-                session.add(dispute)
-                await session.flush()
-                dispute_id = dispute.dispute_id
-            else:
-                log = DisputeActivityLog(
-                    dispute_id=dispute_id,
-                    action_type="FOLLOW_UP_EMAIL_RECEIVED",
-                    notes=f"New email received: {state['subject'][:100]}",
-                )
-                session.add(log)
-
-            # 3. AI analysis
-            analysis = DisputeAIAnalysis(
-                dispute_id=dispute_id,
-                predicted_category=state["dispute_type_name"],
-                confidence_score=state.get("confidence_score", 0.0),
-                ai_summary=state.get("ai_summary", ""),
-                ai_response=state.get("ai_response"),
-                auto_response_generated=state.get("auto_response_generated", False),
-                memory_context_used=state.get("memory_context_used", False),
-                episodes_referenced=state.get("episodes_referenced") or [],
+        # 2. Create or reuse dispute
+        if not dispute_id:
+            dispute = DisputeMaster(
+                email_id=state["email_id"],
+                invoice_id=state.get("matched_invoice_id"),
+                payment_detail_id=state.get("matched_payment_id"),
+                customer_id=state["customer_id"] or "unknown",
+                dispute_type_id=dispute_type.dispute_type_id,
+                status="OPEN",
+                priority=state.get("priority", "MEDIUM"),
+                description=state.get("description", ""),
             )
-            session.add(analysis)
-            await session.flush()
-
-            # 4. Memory episode – incoming email
-            email_episode = DisputeMemoryEpisode(
+            db_session.add(dispute)
+            await db_session.flush()
+            dispute_id = dispute.dispute_id
+        else:
+            log = DisputeActivityLog(
                 dispute_id=dispute_id,
-                episode_type="CUSTOMER_EMAIL",
-                actor="CUSTOMER",
-                content_text=f"Subject: {state['subject']}\n\n{state['body_text'][:1000]}",
+                action_type="FOLLOW_UP_EMAIL_RECEIVED",
+                notes=f"New email received: {state['subject'][:100]}",
+            )
+            db_session.add(log)
+
+        # 3. Create AI analysis
+        analysis = DisputeAIAnalysis(
+            dispute_id=dispute_id,
+            predicted_category=state["dispute_type_name"],
+            confidence_score=state.get("confidence_score", 0.0),
+            ai_summary=state.get("ai_summary", ""),
+            ai_response=state.get("ai_response"),
+            auto_response_generated=state.get("auto_response_generated", False),
+            memory_context_used=state.get("memory_context_used", False),
+            episodes_referenced=state.get("episodes_referenced") or [],
+        )
+        db_session.add(analysis)
+        await db_session.flush()
+
+        # 4. Memory episode – incoming email
+        email_episode = DisputeMemoryEpisode(
+            dispute_id=dispute_id,
+            episode_type="CUSTOMER_EMAIL",
+            actor="CUSTOMER",
+            content_text=f"Subject: {state['subject']}\n\n{state['body_text'][:1000]}",
+            email_id=state["email_id"],
+        )
+        db_session.add(email_episode)
+        await db_session.flush()
+
+        # 5. Memory episode – AI response (if any)
+        if state.get("ai_response"):
+            ai_episode = DisputeMemoryEpisode(
+                dispute_id=dispute_id,
+                episode_type="AI_RESPONSE",
+                actor="AI",
+                content_text=state["ai_response"],
                 email_id=state["email_id"],
             )
-            session.add(email_episode)
-            await session.flush()
+            db_session.add(ai_episode)
+            await db_session.flush()
 
-            # 5. Memory episode – AI response
-            if state.get("ai_response"):
-                ai_episode = DisputeMemoryEpisode(
-                    dispute_id=dispute_id,
-                    episode_type="AI_RESPONSE",
-                    actor="AI",
-                    content_text=state["ai_response"],
-                    email_id=state["email_id"],
-                )
-                session.add(ai_episode)
-                await session.flush()
+            # Mark answered questions
+            answered_ids = state.get("_answers_pending_questions", [])
+            if answered_ids:
+                q_repo = OpenQuestionRepository(db_session)
+                for qid in answered_ids:
+                    q = await q_repo.get_by_id(qid)
+                    if q and q.status == "PENDING":
+                        q.status = "ANSWERED"
+                        q.answered_in_episode_id = ai_episode.episode_id
+                        q.answered_at = datetime.now(timezone.utc)
 
-                answered_ids = state.get("_answers_pending_questions", [])
-                if answered_ids:
-                    q_repo = OpenQuestionRepository(session)
-                    for qid in answered_ids:
-                        q = await q_repo.get_by_id(qid)
-                        if q and q.status == "PENDING":
-                            q.status = "ANSWERED"
-                            q.answered_in_episode_id = ai_episode.episode_id
-                            q.answered_at = datetime.now(timezone.utc)
-
-            # 6. Open questions
-            for question_text in state.get("questions_to_ask", []):
-                question = DisputeOpenQuestion(
-                    dispute_id=dispute_id,
-                    asked_in_episode_id=email_episode.episode_id,
-                    question_text=question_text,
-                    status="PENDING",
-                )
-                session.add(question)
-
-            # 7. Update email routing
-            email_repo = EmailRepository(session)
-            await email_repo.update_status(state["email_id"], "PROCESSED")
-            await session.execute(
-                sa_update(EmailInbox)
-                .where(EmailInbox.email_id == state["email_id"])
-                .values(
-                    dispute_id=dispute_id,
-                    routing_confidence=state.get("routing_confidence", 0.0),
-                )
+        # 6. Open questions
+        for question_text in state.get("questions_to_ask", []):
+            question = DisputeOpenQuestion(
+                dispute_id=dispute_id,
+                asked_in_episode_id=email_episode.episode_id,
+                question_text=question_text,
+                status="PENDING",
             )
+            db_session.add(question)
 
-            # 8. Auto-assign if not auto-responded
-            if not state.get("auto_response_generated"):
-                user_repo = UserRepository(session)
-                all_users = await user_repo.get_all(limit=10)
-                if all_users:
-                    assign = DisputeAssignment(
-                        dispute_id=dispute_id,
-                        assigned_to=all_users[0].user_id,
-                        status="ACTIVE",
-                    )
-                    session.add(assign)
+        # 7. Update email routing
+        email_repo = EmailRepository(db_session)
+        await email_repo.update_status(state["email_id"], "PROCESSED")
 
-            await session.commit()
+        stmt = (
+            sa_update(EmailInbox)
+            .where(EmailInbox.email_id == state["email_id"])
+            .values(
+                dispute_id=dispute_id,
+                routing_confidence=state.get("routing_confidence", 0.0),
+            )
+        )
+        await db_session.execute(stmt)
 
-            analysis_id = analysis.analysis_id
+        # 8. Auto-assign if not auto-responded
+        if not state.get("auto_response_generated"):
+            user_repo = UserRepository(db_session)
+            all_users = await user_repo.get_all(limit=10)
+            if all_users:
+                assign = DisputeAssignment(
+                    dispute_id=dispute_id,
+                    assigned_to=all_users[0].user_id,
+                    status="ACTIVE",
+                )
+                db_session.add(assign)
 
-        # 9. Trigger summarization (outside session)
-        from src.data.clients.postgres import AsyncSessionLocal as ASL2
-        from src.data.repositories.repositories import MemoryEpisodeRepository as MER
-        async with ASL2() as s2:
-            ep_repo = MER(s2)
-            ep_count = await ep_repo.count_for_dispute(dispute_id)
+        await db_session.commit()
+
+        # 9. Trigger summarization if episode threshold reached
+        ep_repo = MemoryEpisodeRepository(db_session)
+        ep_count = await ep_repo.count_for_dispute(dispute_id)
         from src.config.settings import settings
         if ep_count >= settings.EPISODE_SUMMARIZE_THRESHOLD:
             from src.control.tasks import summarize_episodes_task
             summarize_episodes_task.delay(dispute_id)
 
-        return {**state, "dispute_id": dispute_id, "analysis_id": analysis_id}
+        return {**state, "dispute_id": dispute_id, "analysis_id": analysis.analysis_id}
 
     except Exception as e:
         logger.error(f"Persist error for email_id={state['email_id']}: {e}", exc_info=True)
-        # Try to mark email as failed
+        await db_session.rollback()
         try:
-            from src.data.clients.postgres import AsyncSessionLocal as ASL3
-            from src.data.repositories.repositories import EmailRepository as ER3
-            async with ASL3() as s3:
-                er = ER3(s3)
-                await er.update_status(state["email_id"], "FAILED", str(e))
-                await s3.commit()
+            email_repo = EmailRepository(db_session)
+            await email_repo.update_status(state["email_id"], "FAILED", str(e))
+            await db_session.commit()
         except Exception:
             pass
         return {**state, "error": str(e)}
@@ -588,23 +604,22 @@ def build_email_processing_graph(db_session=None, llm_client=None):
 
     graph = StateGraph(EmailProcessingState)
 
-    # db_session param kept for signature compatibility but nodes use AsyncSessionLocal directly
-    graph.add_node("extract_text",                  node_extract_text)
+    graph.add_node("extract_text",                node_extract_text)
     graph.add_node("extract_invoice_data_via_groq", partial(node_extract_invoice_data_via_groq, llm_client=llm_client))
-    graph.add_node("identify_invoice",              node_identify_invoice)
-    graph.add_node("fetch_context",                 node_fetch_context)
-    graph.add_node("classify_email",                partial(node_classify_email,       llm_client=llm_client))
-    graph.add_node("generate_ai_response",          partial(node_generate_ai_response, llm_client=llm_client))
-    graph.add_node("persist_results",               node_persist_results)
+    graph.add_node("identify_invoice",             partial(node_identify_invoice,        db_session=db_session))
+    graph.add_node("fetch_context",                partial(node_fetch_context,            db_session=db_session))
+    graph.add_node("classify_email",               partial(node_classify_email,           llm_client=llm_client))
+    graph.add_node("generate_ai_response",         partial(node_generate_ai_response,     llm_client=llm_client))
+    graph.add_node("persist_results",              partial(node_persist_results,          db_session=db_session))
 
     graph.set_entry_point("extract_text")
-    graph.add_edge("extract_text",                  "extract_invoice_data_via_groq")
+    graph.add_edge("extract_text",                "extract_invoice_data_via_groq")
     graph.add_edge("extract_invoice_data_via_groq", "identify_invoice")
-    graph.add_edge("identify_invoice",              "fetch_context")
-    graph.add_edge("fetch_context",                 "classify_email")
-    graph.add_edge("classify_email",                "generate_ai_response")
-    graph.add_edge("generate_ai_response",          "persist_results")
-    graph.add_edge("persist_results",               END)
+    graph.add_edge("identify_invoice",            "fetch_context")
+    graph.add_edge("fetch_context",               "classify_email")
+    graph.add_edge("classify_email",              "generate_ai_response")
+    graph.add_edge("generate_ai_response",        "persist_results")
+    graph.add_edge("persist_results",             END)
 
     return graph.compile()
 
